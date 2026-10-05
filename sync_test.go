@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"errors"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -55,6 +56,13 @@ func fixture(t *testing.T) (*Env, *string) {
 			Input:   func(_, def string) string { return def },
 			Spin:    func(_ string, fn func() error) error { return fn() },
 		},
+		// No real installers, ever: unexpected calls fail the test.
+		Sh: func(s string, _ io.Writer) error { t.Errorf("unexpected sh: %s", s); return errors.New("no") },
+		Cmd: func(n string, a ...string) ([]byte, error) {
+			t.Errorf("unexpected exec: %s %v", n, a)
+			return nil, errors.New("no")
+		},
+		Look: func(string) bool { return false },
 	}
 	return e, &choice
 }
