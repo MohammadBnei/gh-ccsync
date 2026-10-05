@@ -345,7 +345,7 @@ func (e *Env) apply(acts []action) error {
 			continue
 		}
 		if a.verify != nil && !a.verify() {
-			e.warn("%s: command succeeded but the binary is still not found", a.name)
+			e.warn("%s: command succeeded but the tool is still not usable (see above)", a.name)
 			failed++
 			continue
 		}
