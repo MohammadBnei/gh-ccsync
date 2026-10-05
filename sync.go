@@ -190,7 +190,13 @@ func canon(v any) []byte {
 	return b.Bytes()
 }
 
-func writeObj(p string, o obj) error { return os.WriteFile(p, canon(o), 0o644) }
+// writeObj creates the parent dir: on a new machine ~/.claude does not exist yet.
+func writeObj(p string, o obj) error {
+	if err := os.MkdirAll(filepath.Dir(p), 0o755); err != nil {
+		return err
+	}
+	return os.WriteFile(p, canon(o), 0o644)
+}
 
 func pickKeys(o obj, keys []string) obj {
 	r := obj{}
