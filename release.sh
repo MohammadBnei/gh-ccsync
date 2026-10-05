@@ -7,11 +7,14 @@ set -euo pipefail
 tag=${1:?usage: ./release.sh vX.Y.Z}
 cd "$(dirname "$0")"
 [ -z "$(git status --porcelain)" ] || { echo "commit first"; exit 1; }
+[ "$(git branch --show-current)" = main ] || { echo "release from main only"; exit 1; }
+git fetch -q origin main
+[ "$(git rev-parse HEAD)" = "$(git rev-parse origin/main)" ] || { echo "main is not level with origin/main"; exit 1; }
 go test ./...
 rm -rf dist && mkdir dist
 for t in darwin/arm64 darwin/amd64 linux/amd64 linux/arm64; do
   GOOS=${t%/*} GOARCH=${t#*/} CGO_ENABLED=0 \
     go build -trimpath -ldflags='-s -w' -o "dist/gh-ccsync_${tag}_${t%/*}-${t#*/}" .
 done
-git tag -f "$tag" && git push -q origin main "refs/tags/$tag"
+git tag "$tag" && git push -q origin "refs/tags/$tag"
 gh release create "$tag" dist/* --title "$tag" --generate-notes

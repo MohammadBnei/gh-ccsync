@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"io/fs"
 	"os"
 	"os/exec"
@@ -34,8 +35,16 @@ type Env struct {
 	Home   string // only for shortening paths in output
 	Mode   string // "sync" or "capture"
 	UI
+
+	// External commands, injected so tests never run real ones. nil refuses.
+	Sh        func(script string, out io.Writer) error // sh -c, cwd = Repo
+	Cmd       func(name string, args ...string) ([]byte, error)
+	Look      func(name string) bool
+	ToolMode  string // ToolsAsk, ToolsYes or ToolsReport (default: report)
+	OS        string // GOOS override for tests
 	backupDir string
 	changes   int
+	pending   int // tool steps listed but not run (no consent)
 }
 
 func (e *Env) short(p string) string {
@@ -99,8 +108,15 @@ func Run(e *Env) error {
 	if err := e.syncRepo(); err != nil {
 		return err
 	}
+	// Tools before links (RTK.md needs rtk); a tool problem never fails the sync.
+	if e.Mode == "sync" {
+		_ = e.checkBinaries(false, nil)
+	}
 	if done, err := e.syncSettings(host); done || err != nil {
 		return err
+	}
+	if e.Mode == "sync" {
+		_ = e.checkPlugins(false, nil)
 	}
 	if err := e.syncLinks(); err != nil {
 		return err
@@ -139,7 +155,11 @@ func (e *Env) hostID() (string, error) {
 
 func (e *Env) syncRepo() error {
 	e.step("Repo")
-	if st, _ := git(e.Repo, "status", "--porcelain"); st != "" {
+	st, err := git(e.Repo, "status", "--porcelain")
+	if err != nil {
+		return fmt.Errorf("%s is not a usable git repo: %s", e.Repo, st)
+	}
+	if st != "" {
 		fmt.Fprintln(e.Out, st)
 		e.warn("uncommitted changes in the repo; commit or stash them, then re-run")
 		return errStop
@@ -148,7 +168,7 @@ func (e *Env) syncRepo() error {
 		e.info("no upstream, skipping pull")
 		return nil
 	}
-	err := e.Spin("pulling…", func() error {
+	err = e.Spin("pulling…", func() error {
 		if out, err := git(e.Repo, "pull", "--ff-only", "-q"); err != nil {
 			return fmt.Errorf("git pull: %s", out)
 		}
@@ -210,6 +230,9 @@ func (e *Env) syncSettings(host string) (done bool, err error) {
 	h := filepath.Join(e.Repo, "hosts", host+".json")
 	hl := filepath.Join(e.Repo, "hosts", host+".local.json")
 
+	if err := os.MkdirAll(e.Claude, 0o755); err != nil { // fresh machine: claude never ran
+		return false, err
+	}
 	liveObj, err := readObj(live)
 	if errors.Is(err, fs.ErrNotExist) {
 		liveObj, err = nil, nil
@@ -220,6 +243,7 @@ func (e *Env) syncSettings(host string) (done bool, err error) {
 
 	if _, err := os.Stat(h); errors.Is(err, fs.ErrNotExist) {
 		if !e.Confirm(fmt.Sprintf("No overlay for '%s'. Create hosts/%s.json from current settings?", host, host)) {
+			e.warn("no hosts/%s.json and creating it was declined; stopped", host)
 			return false, errStop
 		}
 		if err := os.MkdirAll(filepath.Dir(h), 0o755); err != nil {
@@ -346,7 +370,7 @@ func (e *Env) captureSettings(live, expect obj, base, h, hl string) error {
 func (e *Env) syncLinks() error {
 	e.step("Links")
 	names := []string{"CLAUDE.md", "statusline.sh"}
-	if _, err := exec.LookPath("rtk"); err == nil {
+	if ok, _ := e.have("rtk"); ok {
 		names = append(names, "RTK.md")
 	} else {
 		e.info("rtk not installed, RTK.md not linked")
