@@ -28,5 +28,5 @@ whether to abort, capture or overwrite. Every file it replaces is backed up to
 
 ## Release
 
-Push a `v*` tag. `cli/gh-extension-precompile` builds the binaries that
-`gh extension install` picks from.
+Run `./release.sh vX.Y.Z`. It tests, cross-builds darwin/linux × amd64/arm64, and uploads them as
+release assets named `*_<os>-<arch>`, which is what `gh extension install` picks from.
