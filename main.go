@@ -50,7 +50,16 @@ func run(args []string) error {
 	cfg := filepath.Join(home, ".config", "claude-config")
 	e := &Env{Claude: claude, Agents: filepath.Join(home, ".agents"), Cfg: cfg, Home: home, Mode: "sync", UI: terminalUI()}
 	e.Look = func(n string) bool { _, err := exec.LookPath(n); return err == nil }
-	e.Cmd = func(n string, a ...string) ([]byte, error) { return exec.Command(n, a...).CombinedOutput() }
+	e.Cmd = func(n string, a ...string) ([]byte, error) {
+		c := exec.Command(n, a...)
+		c.Env = toolEnv(home)
+		if _, err := exec.LookPath(n); err != nil { // e.g. claude in ~/.local/bin, not yet on PATH
+			if alt := filepath.Join(home, ".local", "bin", n); fileExists(alt) {
+				c.Path, c.Err = alt, nil
+			}
+		}
+		return c.Output() // stdout only: stderr noise would break --json parsing
+	}
 	e.ToolMode = ToolsReport
 	if fi, err := os.Stdin.Stat(); err == nil && fi.Mode()&os.ModeCharDevice != 0 && os.Getenv("CCSYNC_CHOICE") == "" {
 		e.ToolMode = ToolsAsk
@@ -123,19 +132,27 @@ func run(args []string) error {
 	return Run(e)
 }
 
+// toolEnv: ~/.local/bin on PATH, apt non-interactive, and $SUDO (empty for
+// root; sudo keeps DEBIAN_FRONTEND, which env_reset would otherwise drop).
+func toolEnv(home string) []string {
+	sudo := "sudo --preserve-env=DEBIAN_FRONTEND"
+	if os.Geteuid() == 0 {
+		sudo = ""
+	}
+	return append(os.Environ(), "SUDO="+sudo, "DEBIAN_FRONTEND=noninteractive",
+		"PATH="+filepath.Join(home, ".local", "bin")+string(os.PathListSeparator)+os.Getenv("PATH"))
+}
+
+func fileExists(p string) bool { _, err := os.Stat(p); return err == nil }
+
 // shRunner runs tool commands from the repo (so tools.json can call tools/*.sh)
 // with ~/.local/bin on PATH, $SUDO empty for root, and apt kept non-interactive.
 // With --yes stdin is /dev/null, so nothing can wait for input.
 func shRunner(repo, home string, yes bool) func(string, io.Writer) error {
-	sudo := "sudo"
-	if os.Geteuid() == 0 {
-		sudo = ""
-	}
 	return func(script string, out io.Writer) error {
 		c := exec.Command("sh", "-c", script)
 		c.Dir = repo
-		c.Env = append(os.Environ(), "SUDO="+sudo, "DEBIAN_FRONTEND=noninteractive",
-			"PATH="+filepath.Join(home, ".local", "bin")+string(os.PathListSeparator)+os.Getenv("PATH"))
+		c.Env = toolEnv(home)
 		if !yes {
 			c.Stdin = os.Stdin
 		}

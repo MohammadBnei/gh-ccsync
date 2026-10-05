@@ -44,6 +44,7 @@ type Env struct {
 	OS        string // GOOS override for tests
 	backupDir string
 	changes   int
+	pending   int // tool steps listed but not run (no consent)
 }
 
 func (e *Env) short(p string) string {

@@ -143,6 +143,14 @@ func (e *Env) checkBinaries(update bool, want map[string]bool) error {
 	}
 	sort.Strings(names)
 
+	approved := filepath.Join(e.Cfg, "tools.approved")
+	prev, _ := os.ReadFile(approved)
+	trusted := bytes.Equal(prev, raw) || e.ToolMode == ToolsYes
+	if prev != nil && !trusted {
+		e.warn("tools.json changed since you last approved it:")
+		e.showDiff(prev, raw)
+	}
+
 	declinedFile := filepath.Join(e.Cfg, "tools.declined")
 	declined := readSet(declinedFile)
 	goos := e.goos()
@@ -153,18 +161,22 @@ func (e *Env) checkBinaries(update bool, want map[string]bool) error {
 			continue
 		}
 		t := tools[n]
-		if want != nil && declined[n] {
-			declined[n] = false // naming it explicitly clears "never"
-			_ = writeSet(declinedFile, declined)
+		if want != nil {
+			declined[n] = false // naming it explicitly overrides "never"
 		}
 		ok, off := e.have(n)
-		if ok && t.Check != "" && e.sh(t.Check, io.Discard) != nil {
+		// check is tools.json shell too: run it only once that file is approved.
+		if ok && t.Check != "" && trusted && e.sh(t.Check, io.Discard) != nil {
 			e.warn("%s found, but `%s` fails (wrong binary?)", n, t.Check)
 			ok = false
 		}
-		verify := func() bool {
+		verify := func() bool { // runs after consent, so check may run too
 			ok, off := e.have(n)
 			offPath = offPath || (ok && off)
+			if ok && t.Check != "" && e.sh(t.Check, io.Discard) != nil {
+				e.warn("%s installed, but `%s` still fails: another %s earlier on PATH?", n, t.Check, n)
+				return false
+			}
 			return ok
 		}
 		switch {
@@ -193,29 +205,41 @@ func (e *Env) checkBinaries(update bool, want map[string]bool) error {
 		}
 	}
 	if len(acts) == 0 {
+		if !trusted && e.ToolMode == ToolsAsk && want == nil { // diff shown, nothing to run
+			_ = os.MkdirAll(e.Cfg, 0o755)
+			_ = os.WriteFile(approved, raw, 0o644)
+		}
 		if failedPre {
 			return errTools
 		}
-		return e.offPathNote(offPath)
+		e.offPathNote(offPath)
+		return nil
 	}
 
-	approved := filepath.Join(e.Cfg, "tools.approved")
-	if prev, err := os.ReadFile(approved); err == nil && !bytes.Equal(prev, raw) && e.ToolMode == ToolsAsk {
-		e.warn("tools.json changed since you last approved it:")
-		e.showDiff(prev, raw)
-	}
 	run, err := e.consent("tools", acts, update, declinedFile)
 	if !run || err != nil {
 		return err
 	}
-	if err := os.MkdirAll(e.Cfg, 0o755); err != nil {
-		return err
-	}
-	if err := os.WriteFile(approved, raw, 0o644); err != nil {
-		return err
+	if want == nil { // a partial run (tools <name>) approves only what it ran
+		if err := os.MkdirAll(e.Cfg, 0o755); err != nil {
+			return err
+		}
+		if err := os.WriteFile(approved, raw, 0o644); err != nil {
+			return err
+		}
 	}
 	err = e.apply(acts)
-	_ = e.offPathNote(offPath)
+	e.offPathNote(offPath)
+	// "never" is cleared only for what is now installed.
+	d := readSet(declinedFile)
+	for _, a := range acts {
+		if ok, _ := e.have(a.name); ok && d[a.name] {
+			d[a.name] = false
+			if werr := writeSet(declinedFile, d); werr != nil {
+				e.warn("tools.declined: %v", werr)
+			}
+		}
+	}
 	if err == nil && failedPre {
 		err = errTools
 	}
@@ -225,7 +249,7 @@ func (e *Env) checkBinaries(update bool, want map[string]bool) error {
 func (e *Env) missing(bins []string) []string {
 	var m []string
 	for _, b := range bins {
-		if !e.look(b) {
+		if ok, _ := e.have(b); !ok {
 			m = append(m, b)
 		}
 	}
@@ -253,11 +277,10 @@ func aptHint(goos string, bins []string) string {
 	return ": " + sudo + "apt-get install -y " + strings.Join(p, " ")
 }
 
-func (e *Env) offPathNote(offPath bool) error {
+func (e *Env) offPathNote(offPath bool) {
 	if offPath {
 		e.warn("~/.local/bin is not on this shell's PATH: open a new shell (exec $SHELL -l) before starting claude")
 	}
-	return nil
 }
 
 func (e *Env) shAction(name, c string, verify func() bool) action {
@@ -285,7 +308,12 @@ func (e *Env) consent(what string, acts []action, update bool, declinedFile stri
 		return true, nil
 	case ToolsAsk:
 	default:
-		e.warn("%d %s step(s) pending: run `gh ccsync tools` to apply", len(acts), what)
+		e.pending += len(acts)
+		if e.Mode == "tools" {
+			e.warn("%d %s step(s) pending: no terminal to confirm, re-run with --yes", len(acts), what)
+		} else {
+			e.warn("%d %s step(s) pending: run `gh ccsync tools` to apply", len(acts), what)
+		}
 		return false, nil
 	}
 	if update {
@@ -297,7 +325,9 @@ func (e *Env) consent(what string, acts []action, update bool, declinedFile stri
 	case "never":
 		d := readSet(declinedFile)
 		for _, a := range acts {
-			d[a.name] = true
+			if !strings.HasPrefix(a.name, "marketplace") {
+				d[a.name] = true
+			}
 		}
 		e.info("won't ask again on this host; `gh ccsync tools <name>` installs it")
 		return false, writeSet(declinedFile, d)
@@ -330,14 +360,18 @@ func (e *Env) apply(acts []action) error {
 
 // --- plugins --------------------------------------------------------------
 
+// jsonList reads one field of a `claude … --json` list; nil when the CLI
+// fails or prints something else, so callers never mistake that for "none".
 func (e *Env) jsonList(field string, args ...string) map[string]bool {
-	s := map[string]bool{}
 	out, err := e.cmd("claude", args...)
 	if err != nil {
-		return s
+		return nil
 	}
 	var l []map[string]any
-	_ = json.Unmarshal(out, &l)
+	if json.Unmarshal(out, &l) != nil {
+		return nil
+	}
+	s := map[string]bool{}
 	for _, m := range l {
 		if v, ok := m[field].(string); ok {
 			s[v] = true
@@ -362,7 +396,7 @@ func marketSource(extra map[string]any, mkt string) string {
 // settings.json; ccsync owns that file, so it is restored afterwards.
 func (e *Env) checkPlugins(update bool, want map[string]bool) error {
 	e.step("Plugins")
-	if !e.look("claude") {
+	if ok, _ := e.have("claude"); !ok {
 		e.info("claude not on PATH, skipping plugins")
 		return nil
 	}
@@ -376,6 +410,10 @@ func (e *Env) checkPlugins(update bool, want map[string]bool) error {
 	extra, _ := s["extraKnownMarketplaces"].(map[string]any)
 	var ids []string
 	for id, v := range enabled {
+		if strings.HasPrefix(id, "-") { // would become a claude flag
+			e.warn("ignoring plugin id %q", id)
+			continue
+		}
 		if b, _ := v.(bool); b && match(want, id) {
 			ids = append(ids, id)
 		}
@@ -389,6 +427,10 @@ func (e *Env) checkPlugins(update bool, want map[string]bool) error {
 	declined := readSet(declinedFile)
 	installed := e.jsonList("id", "plugin", "list", "--json")
 	markets := e.jsonList("name", "plugin", "marketplace", "list", "--json")
+	if installed == nil || markets == nil {
+		e.warn("could not read plugin state from `claude plugin list --json`; skipping plugins")
+		return nil
+	}
 	var acts []action
 	for _, id := range ids {
 		_, mkt, _ := strings.Cut(id, "@")
@@ -402,7 +444,7 @@ func (e *Env) checkPlugins(update bool, want map[string]bool) error {
 		default:
 			if !markets[mkt] {
 				src := marketSource(extra, mkt)
-				if src == "" {
+				if src == "" || strings.HasPrefix(src, "-") {
 					e.warn("%s: marketplace %q is not declared in extraKnownMarketplaces, skipped", id, mkt)
 					continue
 				}
@@ -425,15 +467,16 @@ func (e *Env) checkPlugins(update bool, want map[string]bool) error {
 		return err
 	}
 
-	before, _ := os.ReadFile(live)
+	before, rerr := os.ReadFile(live)
+	fi, serr := os.Stat(live)
 	err = e.apply(acts)
-	if after, _ := os.ReadFile(live); !bytes.Equal(before, after) {
+	if after, _ := os.ReadFile(live); rerr == nil && serr == nil && !bytes.Equal(before, after) {
 		e.warn("the plugin CLI rewrote settings.json; restoring the synced version")
 		if berr := e.backup(live); berr != nil {
-			return berr
+			return errors.Join(err, berr)
 		}
-		if werr := os.WriteFile(live, before, 0o644); werr != nil {
-			return werr
+		if werr := os.WriteFile(live, before, fi.Mode().Perm()); werr != nil {
+			return errors.Join(err, werr)
 		}
 	}
 	return err
@@ -469,7 +512,7 @@ func RunTools(e *Env, names []string) error {
 		e.warn("unknown tool or plugin: %s", strings.Join(unknown, ", "))
 		return errStop
 	}
-	if errB != nil || errP != nil {
+	if errB != nil || errP != nil || e.pending > 0 {
 		return errStop
 	}
 	fmt.Fprintln(e.Out)

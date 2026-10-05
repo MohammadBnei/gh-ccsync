@@ -114,10 +114,49 @@ func TestToolsLinuxPrereqs(t *testing.T) {
 func TestToolsCheckCatchesWrongBinary(t *testing.T) {
 	e, _, ran := toolsFixture(t, `{"rtk": {"install": "install rtk", "check": "rtk-is-wrong"}}`)
 	e.Look = func(n string) bool { return n == "rtk" }
+	e.ToolMode = ToolsYes
 	must(t, pass(t, e))
 	if !slices.Contains(*ran, "install rtk") {
 		t.Fatalf("a failing check should count as missing: %q", *ran)
 	}
+}
+
+// check is shell from tools.json: never run before that file is approved.
+func TestToolsCheckNotRunUnapproved(t *testing.T) {
+	e, _, ran := toolsFixture(t, `{"rtk": {"install": "install rtk", "check": "rtk-is-wrong"}}`)
+	e.Look = func(n string) bool { return n == "rtk" }
+	e.ToolMode = ToolsReport
+	must(t, pass(t, e))
+	if len(*ran) != 0 {
+		t.Fatalf("ran %q before approval", *ran)
+	}
+}
+
+func TestToolsWithoutTTYNeedsYes(t *testing.T) {
+	e, _, ran := toolsFixture(t, twoTools)
+	e.ToolMode = ToolsReport
+	if err := RunTools(e, nil); !errors.Is(err, errStop) {
+		t.Fatalf("pending steps without --yes: want errStop, got %v", err)
+	}
+	if len(*ran) != 0 {
+		t.Fatalf("ran %q", *ran)
+	}
+}
+
+func TestPluginsUnreadableStateInstallsNothing(t *testing.T) {
+	e, _ := fixture(t)
+	write(t, filepath.Join(e.Claude, "settings.json"), `{"enabledPlugins": {"a@m": true},
+	  "extraKnownMarketplaces": {"m": {"source": {"source": "github", "repo": "o/m"}}}}`)
+	e.Look = func(n string) bool { return n == "claude" }
+	e.ToolMode = ToolsYes
+	e.Cmd = func(_ string, args ...string) ([]byte, error) {
+		if slices.Contains(args, "--json") {
+			return []byte("Unknown option --json"), nil
+		}
+		t.Errorf("ran claude %v with unknown plugin state", args)
+		return nil, nil
+	}
+	must(t, e.checkPlugins(false, nil))
 }
 
 func TestCmdForPerOS(t *testing.T) {
