@@ -117,6 +117,16 @@ func TestFirstRunThenIdempotent(t *testing.T) {
 	}
 }
 
+// A new machine where Claude Code never ran has no ~/.claude at all.
+func TestFreshHomeWithoutClaudeDir(t *testing.T) {
+	e, _ := fixture(t)
+	must(t, os.RemoveAll(e.Claude))
+	must(t, pass(t, e))
+	if _, err := readObj(filepath.Join(e.Claude, "settings.json")); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func TestSettingsDrift(t *testing.T) {
 	e, choice := fixture(t)
 	must(t, pass(t, e))
