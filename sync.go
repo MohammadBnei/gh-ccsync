@@ -526,7 +526,9 @@ func (e *Env) syncAgents() (done bool, err error) {
 		return os.WriteFile(agen, []byte(strings.Join(e.manifest(), "\n")+"\n"), 0o644)
 	}
 
-	if prev, err := readLines(agen); err == nil {
+	prev, err := readLines(agen)
+	switch {
+	case err == nil:
 		if cur := e.manifest(); !slices.Equal(prev, cur) {
 			e.warn("%s changed since the last sync (npx skills add/update?):", e.short(e.Agents))
 			e.manifestDiff(prev, cur)
@@ -546,12 +548,14 @@ func (e *Env) syncAgents() (done bool, err error) {
 				return false, errStop
 			}
 		}
-	} else if err := e.snapshotAgents(); err != nil {
+	case !errors.Is(err, fs.ErrNotExist):
 		return false, err
-	}
-	if _, err := os.Stat(agen); err != nil {
-		if added, differ := localSkills(live, repo, skip); len(added)+len(differ) > 0 {
-			// Never synced here: the mirror below would delete this machine's own skills.
+	default:
+		// Never synced here: the mirror below would delete this machine's own skills.
+		pending := filepath.Join(e.Claude, ".agents.merge-pending")
+		added, differ := localSkills(live, repo, skip)
+		_, merged := os.Stat(pending)
+		if len(added) > 0 || (len(differ) > 0 && merged != nil) {
 			e.warn("first sync on this machine: %s has skills the repo does not:", e.short(live))
 			if len(added) > 0 {
 				fmt.Fprintln(e.Out, sOK.Render("    only here: "+strings.Join(added, ", ")))
@@ -561,8 +565,8 @@ func (e *Env) syncAgents() (done bool, err error) {
 			}
 			switch e.pick("keep this machine's skills?", "abort", "merge", "overwrite") {
 			case "merge", "capture":
-				// Only skills the repo lacks are copied in; for a differing one the
-				// repo copy wins and the local one is backed up below by the mirror step.
+				// Skills the repo lacks are copied in; for a differing one the repo
+				// copy wins once applied, and the snapshot keeps this machine's copy.
 				if err := mergeLock(lockLive, lockRepo); err != nil {
 					return false, err
 				}
@@ -573,19 +577,27 @@ func (e *Env) syncAgents() (done bool, err error) {
 					e.ok("merged agents/skills/%s", n)
 				}
 				for _, n := range differ {
-					e.warn("%s: the repo version wins; this machine's copy is in the backup", n)
+					e.warn("%s: the repo version wins; this machine's copy goes to the backup", n)
 				}
 				if len(added) > 0 {
+					// Next run (after the commit) applies the repo without asking again.
+					if err := os.WriteFile(pending, nil, 0o644); err != nil {
+						return false, err
+					}
 					e.warn("merged into the repo, nothing deleted: commit and push it, then re-run")
 					return true, nil
 				}
-				// nothing new to commit: apply the repo now
-			case "overwrite": // the snapshot above holds everything replaced
+			case "overwrite":
 			default:
 				e.warn("aborted, nothing changed in %s", e.short(e.Agents))
 				return false, errStop
 			}
 		}
+		// About to change ~/.agents for the first time: keep a full copy.
+		if err := e.snapshotAgents(); err != nil {
+			return false, err
+		}
+		defer os.Remove(pending)
 	}
 
 	changed, err := mirror(repo, live, skip)
@@ -637,7 +649,7 @@ func (e *Env) syncAgents() (done bool, err error) {
 func localSkills(live, repo string, skip map[string]bool) (added, differ []string) {
 	ents, _ := os.ReadDir(live)
 	for _, d := range ents {
-		if skip[d.Name()] {
+		if skip[d.Name()] || strings.HasPrefix(d.Name(), ".") { // .DS_Store and the like
 			continue
 		}
 		r := dirSum(filepath.Join(repo, d.Name()))
@@ -673,7 +685,11 @@ func dirSum(p string) string {
 			fmt.Fprintf(h, "%s\x00unreadable\x00", r)
 			return nil
 		}
-		fmt.Fprintf(h, "%s\x00%v\x00", r, info.Mode())
+		mode := info.Mode().Type() // git keeps no dir modes; files keep their perm
+		if info.Mode().IsRegular() {
+			mode = info.Mode()
+		}
+		fmt.Fprintf(h, "%s\x00%v\x00", r, mode)
 		switch {
 		case d.Type()&fs.ModeSymlink != 0:
 			t, _ := os.Readlink(q)
@@ -717,40 +733,58 @@ func (e *Env) backupDirOrNew() string {
 // backup before a machine's first sync touches it: whatever merge, overwrite
 // or a later mirror replaces stays recoverable.
 func (e *Env) snapshotAgents() error {
-	ents, _ := os.ReadDir(e.Agents)
+	root, err := filepath.EvalSymlinks(e.Agents) // ~/.agents may itself be a link
+	if err != nil {
+		return nil // nothing there yet
+	}
+	ents, _ := os.ReadDir(root)
 	if len(ents) == 0 {
 		return nil
 	}
 	dst := filepath.Join(e.backupDirOrNew(), ".agents")
-	if err := copyTree(e.Agents, dst); err != nil {
-		return err
-	}
+	skipped := copyTree(root, dst)
 	e.info("first sync: copied %s → %s", e.short(e.Agents), e.short(dst))
+	if len(skipped) > 0 {
+		e.warn("not copied (special or unreadable): %s", strings.Join(skipped, ", "))
+	}
 	return nil
 }
 
-// copyTree copies src to dst as is: files with their mode, symlinks as links.
-func copyTree(src, dst string) error {
-	return filepath.WalkDir(src, func(p string, d fs.DirEntry, err error) error {
-		if err != nil {
-			return err
-		}
+// copyTree copies dirs, regular files (with their mode) and symlinks (as
+// links) from src to dst. Anything else, or anything unreadable, is skipped
+// and returned, so a fifo or a mode-000 file cannot block a sync.
+func copyTree(src, dst string) (skipped []string) {
+	_ = filepath.WalkDir(src, func(p string, d fs.DirEntry, err error) error {
 		r, _ := filepath.Rel(src, p)
 		t := filepath.Join(dst, r)
+		if err != nil {
+			skipped = append(skipped, r)
+			if d != nil && d.IsDir() {
+				return filepath.SkipDir
+			}
+			return nil
+		}
+		var cerr error
 		switch {
+		case d.IsDir():
+			cerr = os.MkdirAll(t, 0o755)
 		case d.Type()&fs.ModeSymlink != 0:
 			l, err := os.Readlink(p)
-			if err != nil {
-				return err
+			if cerr = err; err == nil {
+				_ = os.MkdirAll(filepath.Dir(t), 0o755)
+				cerr = os.Symlink(l, t)
 			}
-			return os.Symlink(l, t)
-		case d.IsDir():
-			return os.MkdirAll(t, 0o755)
+		case d.Type().IsRegular():
+			_, cerr = copyFile(p, t)
 		default:
-			_, err := copyFile(p, t)
-			return err
+			cerr = errors.New("special file")
 		}
+		if cerr != nil {
+			skipped = append(skipped, r)
+		}
+		return nil
 	})
+	return skipped
 }
 
 // mergeLock adds live lock entries the repo lock lacks; repo entries win.

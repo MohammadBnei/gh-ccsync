@@ -8,6 +8,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"syscall"
 	"testing"
 )
 
@@ -327,9 +328,6 @@ func TestFirstSyncMergeEdgeCases(t *testing.T) {
 	if read(t, filepath.Join(e.Repo, "agents/skills/s1/SKILL.md")) != "s1\n" {
 		t.Error("merge overwrote the repo's s1 with the local copy")
 	}
-	if read(t, filepath.Join(e.backupDir, ".agents/skills/s1/SKILL.md")) != "old local s1\n" {
-		t.Error("local s1 not in the first-sync snapshot")
-	}
 	if read(t, filepath.Join(e.Agents, "skills/s1/SKILL.md")) != "old local s1\n" {
 		t.Error("merge changed ~/.agents before the commit")
 	}
@@ -339,8 +337,17 @@ func TestFirstSyncMergeEdgeCases(t *testing.T) {
 	if read(t, filepath.Join(e.Repo, "agents/skills/notes.md")) != "stray\n" {
 		t.Error("stray file not merged")
 	}
+	if e.backupDir != "" {
+		if _, err := os.Stat(filepath.Join(e.backupDir, ".agents")); err == nil {
+			t.Error("merge took a snapshot although it changed nothing in ~/.agents")
+		}
+	}
 	commitAll(t, e.Repo)
+	*choice = "abort" // the run after the commit must not ask again
 	must(t, pass(t, e))
+	if read(t, filepath.Join(e.backupDir, ".agents/skills/cloned/.git/HEAD")) != "ref\n" {
+		t.Error("snapshot misses the nested .git")
+	}
 	if read(t, filepath.Join(e.Agents, "skills/cloned/SKILL.md")) != "cloned\n" {
 		t.Error("merged skill lost after the follow-up sync")
 	}
@@ -349,6 +356,9 @@ func TestFirstSyncMergeEdgeCases(t *testing.T) {
 	}
 	if read(t, filepath.Join(e.Agents, "skills/s1/SKILL.md")) != "s1\n" {
 		t.Error("repo s1 not restored after the commit")
+	}
+	if read(t, filepath.Join(e.backupDir, ".agents/skills/s1/SKILL.md")) != "old local s1\n" {
+		t.Error("local s1 not in the first-sync snapshot")
 	}
 	must(t, pass(t, e))
 	if e.changes != 0 {
@@ -396,9 +406,26 @@ func TestDirSumSeesModesAndLinks(t *testing.T) {
 // snapshot keeps the machine's copy.
 func TestFirstSyncSnapshotsLockOnly(t *testing.T) {
 	e, _ := fixture(t)
+	must(t, syscall.Mkfifo(filepath.Join(e.Agents, "a-fifo"), 0o644)) // must not hang or fail the snapshot
 	write(t, filepath.Join(e.Agents, ".skill-lock.json"), `{"skills":{"local-only":{}},"version":3}`)
 	must(t, pass(t, e))
 	if !strings.Contains(read(t, filepath.Join(e.backupDir, ".agents/.skill-lock.json")), "local-only") {
 		t.Error("machine's lock not in the snapshot")
+	}
+	if read(t, filepath.Join(e.Agents, ".skill-lock.json")) != `{"skills":{}}` {
+		t.Error("repo lock not applied")
+	}
+}
+
+func TestFirstSyncSymlinkedAgents(t *testing.T) {
+	e, _ := fixture(t)
+	real := filepath.Join(e.Home, "dotfiles/agents")
+	must(t, os.MkdirAll(filepath.Dir(real), 0o755))
+	must(t, os.Rename(e.Agents, real))
+	must(t, os.Symlink(real, e.Agents))
+	write(t, filepath.Join(real, ".skill-lock.json"), `{"skills":{"x":{}}}`)
+	must(t, pass(t, e))
+	if !strings.Contains(read(t, filepath.Join(e.backupDir, ".agents/.skill-lock.json")), `"x"`) {
+		t.Error("snapshot of a symlinked ~/.agents is empty")
 	}
 }
