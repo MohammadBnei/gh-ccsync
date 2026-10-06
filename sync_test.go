@@ -328,7 +328,10 @@ func TestFirstSyncMergeEdgeCases(t *testing.T) {
 		t.Error("merge overwrote the repo's s1 with the local copy")
 	}
 	if read(t, filepath.Join(e.backupDir, ".agents/skills/s1/SKILL.md")) != "old local s1\n" {
-		t.Error("local s1 not backed up")
+		t.Error("local s1 not in the first-sync snapshot")
+	}
+	if read(t, filepath.Join(e.Agents, "skills/s1/SKILL.md")) != "old local s1\n" {
+		t.Error("merge changed ~/.agents before the commit")
 	}
 	if _, err := os.Stat(filepath.Join(e.Repo, "agents/skills/cloned/.git")); err == nil {
 		t.Error(".git copied into the repo")
@@ -340,6 +343,12 @@ func TestFirstSyncMergeEdgeCases(t *testing.T) {
 	must(t, pass(t, e))
 	if read(t, filepath.Join(e.Agents, "skills/cloned/SKILL.md")) != "cloned\n" {
 		t.Error("merged skill lost after the follow-up sync")
+	}
+	if read(t, filepath.Join(e.Agents, "skills/cloned/.git/HEAD")) != "ref\n" {
+		t.Error("the follow-up sync deleted the skill's .git")
+	}
+	if read(t, filepath.Join(e.Agents, "skills/s1/SKILL.md")) != "s1\n" {
+		t.Error("repo s1 not restored after the commit")
 	}
 	must(t, pass(t, e))
 	if e.changes != 0 {
@@ -380,5 +389,16 @@ func TestDirSumSeesModesAndLinks(t *testing.T) {
 	must(t, os.Chmod(filepath.Join(d, "b/x.sh"), 0o644))
 	if dirSum(filepath.Join(d, "a")) == dirSum(filepath.Join(d, "b")) {
 		t.Error("link target change not seen")
+	}
+}
+
+// First sync with only a lock that differs: the lock is replaced, but the
+// snapshot keeps the machine's copy.
+func TestFirstSyncSnapshotsLockOnly(t *testing.T) {
+	e, _ := fixture(t)
+	write(t, filepath.Join(e.Agents, ".skill-lock.json"), `{"skills":{"local-only":{}},"version":3}`)
+	must(t, pass(t, e))
+	if !strings.Contains(read(t, filepath.Join(e.backupDir, ".agents/.skill-lock.json")), "local-only") {
+		t.Error("machine's lock not in the snapshot")
 	}
 }
