@@ -26,6 +26,12 @@ and git is its only runtime dependency.
 6. Mirrors `agents/skills` into `~/.agents/skills` and links each skill into
    `~/.claude/skills`. Symlinked skills (local checkouts) are left alone.
 
+On a machine's first sync, skills it already has that the repo lacks are
+never deleted: it offers merge (copy them into the repo, union the skill lock,
+delete nothing) / overwrite (with backup) / abort. Skills made directly in
+`~/.claude/skills` (a real dir with a `SKILL.md`) are offered for capture into
+`skills/` on every sync.
+
 If something changed locally since the last sync (Claude rewrote
 settings.json, `npx skills add`, an edited CLAUDE.md), it shows the diff and asks
 whether to abort, capture or overwrite. Every file it replaces is backed up to
