@@ -278,25 +278,51 @@ func (e *Env) syncSettings(host string) (done bool, err error) {
 		}
 	}
 
-	// base + host + host.local; a top-level key replaces, no deep merge.
-	merged := obj{}
-	for _, p := range []string{base, h, hl} {
-		o, err := readObj(p)
-		if err != nil {
-			return false, err
-		}
-		for k, v := range o {
-			merged[k] = v
-		}
+	merged, err := mergedSettings(base, h, hl)
+	if err != nil {
+		return false, err
 	}
 
 	// What live should look like if nothing changed it since the last sync.
-	expect := merged
-	if g, err := readObj(gen); err == nil {
-		expect = g
+	expect, err := readObj(gen)
+	if err != nil && liveObj != nil {
+		// Never synced here: live is this machine's own settings, not drift from
+		// a sync. Only keys live has and the repo holds differently need a choice.
+		if drift := settingsDrift(liveObj, merged); len(drift) > 0 {
+			e.warn("first sync on this machine: %s differs from the repo:", e.short(live))
+			e.showDiff(canon(pickKeys(merged, drift)), canon(pickKeys(liveObj, drift)))
+			switch e.pick("keep this machine's settings?", "abort", "merge", "overwrite") {
+			case "merge", "capture":
+				hostChanged, err := e.mergeHostSettings(liveObj, drift, h, hl)
+				if err != nil {
+					return false, err
+				}
+				if merged, err = mergedSettings(base, h, hl); err != nil {
+					return false, err
+				}
+				if hostChanged {
+					if e.canHandoff() && e.Confirm("Open claude in the repo to move what every machine shares into settings.base.json?") {
+						if err := e.Sh(claudeHandoff(host), os.Stdout); err != nil {
+							e.warn("claude: %v", err)
+						}
+						e.warn("review with git -C %s diff, commit, push, then re-run", e.short(e.Repo))
+						return true, nil
+					}
+					e.warn("hosts/%s.json changed: commit and push it", host)
+				}
+			case "overwrite":
+				if err := e.backup(live); err != nil {
+					return false, err
+				}
+				liveObj = nil
+			default:
+				e.warn("aborted, nothing written")
+				return false, errStop
+			}
+		}
 	}
 
-	if liveObj != nil && !bytes.Equal(canon(liveObj), canon(expect)) {
+	if expect != nil && liveObj != nil && !bytes.Equal(canon(liveObj), canon(expect)) {
 		e.warn("%s changed since the last sync:", e.short(live))
 		e.showDiff(canon(expect), canon(liveObj))
 		switch e.pick("settings.json drifted", "abort", "capture", "overwrite") {
@@ -329,7 +355,97 @@ func (e *Env) syncSettings(host string) (done bool, err error) {
 		e.changes++
 		e.ok("settings.json written")
 	}
+	e.shadowNotice(host, base, h)
 	return false, writeObj(gen, merged)
+}
+
+// mergedSettings is base + host + host.local; a top-level key replaces, no deep merge.
+func mergedSettings(files ...string) (obj, error) {
+	merged := obj{}
+	for _, p := range files {
+		o, err := readObj(p)
+		if err != nil {
+			return nil, err
+		}
+		for k, v := range o {
+			merged[k] = v
+		}
+	}
+	return merged, nil
+}
+
+// settingsDrift: keys live has that merged lacks or holds differently. Keys
+// only merged has are not drift: a first sync just adds them.
+func settingsDrift(live, merged obj) []string {
+	var keys []string
+	for k, v := range live {
+		if mv, ok := merged[k]; !ok || !bytes.Equal(canon(v), canon(mv)) {
+			keys = append(keys, k)
+		}
+	}
+	sort.Strings(keys)
+	return keys
+}
+
+// mergeHostSettings writes live's value of each key into this host's overlay
+// (local keys into .local.json). Never the shared base, never a delete.
+func (e *Env) mergeHostSettings(live obj, keys []string, h, hl string) (hostChanged bool, err error) {
+	for _, f := range []string{h, hl} {
+		o, err := readObj(f)
+		if err != nil {
+			return false, err
+		}
+		n := 0
+		for _, k := range keys {
+			if slices.Contains(localKeys, k) == (f == hl) {
+				o[k] = live[k]
+				n++
+				e.ok("merged '%s' → %s", k, e.rel(f))
+			}
+		}
+		if n > 0 {
+			if err := writeObj(f, o); err != nil {
+				return false, err
+			}
+			hostChanged = hostChanged || f == h
+		}
+	}
+	return hostChanged, nil
+}
+
+// canHandoff: an interactive claude only on a tty, never under CCSYNC_CHOICE.
+func (e *Env) canHandoff() bool {
+	return e.ToolMode == ToolsAsk && e.Mode == "sync" &&
+		(e.Look("claude") || fileExists(filepath.Join(e.Home, ".local", "bin", "claude")))
+}
+
+// claudeHandoff is the sh command opening claude on the overlay just merged.
+func claudeHandoff(host string) string {
+	p := fmt.Sprintf("gh ccsync merged this machine's settings that differ from the repo into hosts/%[1]s.json. "+
+		"Compare it with settings.base.json (top-level keys replace, no deep merge): move what every machine "+
+		"should share into settings.base.json and drop it from hosts/%[1]s.json; keep platform- or "+
+		"machine-specific values in hosts/%[1]s.json. Do not commit.", host)
+	return "claude '" + strings.ReplaceAll(p, "'", `'\''`) + "'"
+}
+
+// shadowNotice names keys this host's overlay overrides in base: base edits
+// to them no longer reach this machine.
+func (e *Env) shadowNotice(host, base, h string) {
+	b, err1 := readObj(base)
+	o, err2 := readObj(h)
+	if err1 != nil || err2 != nil {
+		return
+	}
+	var keys []string
+	for k, v := range o {
+		if bv, ok := b[k]; ok && !slices.Contains(hostKeys, k) && !bytes.Equal(canon(v), canon(bv)) {
+			keys = append(keys, k)
+		}
+	}
+	if len(keys) > 0 {
+		sort.Strings(keys)
+		e.info("hosts/%s.json overrides base: %s", host, strings.Join(keys, ", "))
+	}
 }
 
 // captureSettings writes each changed top-level key back to the file that owns it.

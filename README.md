@@ -5,7 +5,7 @@ A gh extension that syncs a Claude Code config repo (e.g. a private
 and git is its only runtime dependency.
 
     gh extension install MohammadBnei/gh-ccsync
-    gh ccsync init MohammadBnei/claude-config   # clone + first apply
+    gh ccsync init MohammadBnei/claude-config   # asks where to clone, then first apply
     gh ccsync                                   # pull + apply
     gh ccsync capture                           # local changes → repo
     gh ccsync tools [--yes] [name…]             # install missing tools/plugins, update present ones
@@ -25,6 +25,17 @@ and git is its only runtime dependency.
    `commands/*.md` and `skills/*` into `~/.claude`.
 6. Mirrors `agents/skills` into `~/.agents/skills` and links each skill into
    `~/.claude/skills`. Symlinked skills (local checkouts) are left alone.
+
+On a machine's first sync, settings it already has that differ from the repo
+are not drift: it offers merge (copy them into `hosts/<id>.json`, or
+`.local.json` for local keys, never into `settings.base.json`) / overwrite (with
+backup) / abort. Keys only the repo has are added without asking. On a tty with
+`claude` installed, merge can open claude in the repo to move what every machine
+shares into the base; you review and commit. Each sync lists the base keys your
+host file overrides. See `docs/adr/0001-first-sync-settings-merge.md`.
+
+`init` asks where to clone (default `~/Code/claude-config`); an existing
+checkout there is reused. `CCSYNC_CHOICE=merge` picks merge without a tty.
 
 On a machine's first sync, skills it already has that the repo lacks are
 never deleted: it offers merge (copy them into the repo, union the skill lock,
