@@ -124,6 +124,9 @@ func Run(e *Env) error {
 	if done, err := e.syncAgents(); done || err != nil {
 		return err
 	}
+	if err := e.syncClaudeSkills(); err != nil {
+		return err
+	}
 
 	msg := "no changes"
 	if e.changes > 0 {
@@ -537,6 +540,33 @@ func (e *Env) syncAgents() (done bool, err error) {
 				return false, errStop
 			}
 		}
+	} else if local := localSkills(live, repo, skip); len(local) > 0 {
+		// Never synced here: the mirror below would delete this machine's own skills.
+		e.warn("first sync on this machine: %s has skills the repo lacks or holds differently:", e.short(live))
+		fmt.Fprintln(e.Out, sInfo.Render("    "+strings.Join(local, ", ")))
+		switch e.pick("keep this machine's skills?", "abort", "merge", "overwrite") {
+		case "merge", "capture":
+			for _, n := range local {
+				if _, err := mirror(filepath.Join(live, n), filepath.Join(repo, n), nil); err != nil {
+					return false, err
+				}
+				e.ok("merged agents/skills/%s", n)
+			}
+			if err := mergeLock(lockLive, lockRepo); err != nil {
+				return false, err
+			}
+			e.warn("merged into the repo (nothing deleted): review, commit, push, then re-run")
+			return true, nil
+		case "overwrite":
+			for _, n := range local {
+				if err := e.backup(filepath.Join(live, n)); err != nil {
+					return false, err
+				}
+			}
+		default:
+			e.warn("aborted, nothing changed")
+			return false, errStop
+		}
 	}
 
 	changed, err := mirror(repo, live, skip)
@@ -581,6 +611,111 @@ func (e *Env) syncAgents() (done bool, err error) {
 		e.ok("linked skill %s", d.Name())
 	}
 	return false, nil
+}
+
+// localSkills: real skill dirs in live that the repo lacks or holds with
+// different content.
+func localSkills(live, repo string, skip map[string]bool) []string {
+	var l []string
+	ents, _ := os.ReadDir(live)
+	for _, d := range ents {
+		if skip[d.Name()] || !d.IsDir() {
+			continue
+		}
+		if dirSum(filepath.Join(live, d.Name())) != dirSum(filepath.Join(repo, d.Name())) {
+			l = append(l, d.Name())
+		}
+	}
+	return l
+}
+
+// dirSum hashes every regular file's path and content under dir ("" if missing).
+func dirSum(dir string) string {
+	h := sha1.New()
+	_ = filepath.WalkDir(dir, func(p string, d fs.DirEntry, err error) error {
+		if err != nil || !d.Type().IsRegular() {
+			return nil
+		}
+		b, err := os.ReadFile(p)
+		if err != nil {
+			return nil
+		}
+		r, _ := filepath.Rel(dir, p)
+		fmt.Fprintf(h, "%s\x00%x\x00", r, sha1.Sum(b))
+		return nil
+	})
+	if _, err := os.Stat(dir); err != nil {
+		return ""
+	}
+	return hex.EncodeToString(h.Sum(nil))
+}
+
+// mergeLock adds live lock entries the repo lock lacks; repo entries win.
+func mergeLock(live, repo string) error {
+	l, err := readObj(live)
+	if errors.Is(err, fs.ErrNotExist) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	r, err := readObj(repo)
+	if errors.Is(err, fs.ErrNotExist) {
+		_, err = copyFile(live, repo)
+		return err
+	}
+	if err != nil {
+		return err
+	}
+	ls, _ := l["skills"].(map[string]any)
+	rs, _ := r["skills"].(map[string]any)
+	if rs == nil {
+		rs = map[string]any{}
+	}
+	for k, v := range ls {
+		if _, ok := rs[k]; !ok {
+			rs[k] = v
+		}
+	}
+	r["skills"] = rs
+	return writeObj(repo, r)
+}
+
+// syncClaudeSkills offers to capture skills made directly in ~/.claude/skills
+// (real dirs with a SKILL.md that neither repo skill dir has).
+func (e *Env) syncClaudeSkills() error {
+	dir := filepath.Join(e.Claude, "skills")
+	var found []string
+	ents, _ := os.ReadDir(dir)
+	for _, d := range ents {
+		n := d.Name()
+		if d.Type()&fs.ModeSymlink != 0 || !d.IsDir() {
+			continue
+		}
+		if _, err := os.Stat(filepath.Join(dir, n, "SKILL.md")); err != nil {
+			continue // e.g. Claude's own learned/ and synced/ stores
+		}
+		if dirSum(filepath.Join(e.Repo, "skills", n)) != "" || dirSum(filepath.Join(e.Repo, "agents", "skills", n)) != "" {
+			continue
+		}
+		found = append(found, n)
+	}
+	if len(found) == 0 {
+		return nil
+	}
+	e.warn("skills only on this machine, in %s: %s", e.short(dir), strings.Join(found, ", "))
+	if e.pick("add them to the repo?", "skip", "capture") != "capture" {
+		e.info("left alone; `gh ccsync capture` adds them")
+		return nil
+	}
+	for _, n := range found {
+		if _, err := mirror(filepath.Join(dir, n), filepath.Join(e.Repo, "skills", n), nil); err != nil {
+			return err
+		}
+		e.ok("captured skills/%s", n)
+	}
+	e.warn("captured into the repo: review, commit, push, then re-run")
+	return nil
 }
 
 // manifestDiff prints up to 20 added (+), changed (~) and removed (-) paths.

@@ -254,3 +254,52 @@ func TestManifestMatchesShasum(t *testing.T) {
 		}
 	}
 }
+
+// A machine that was never synced keeps its own skills: merge adds them to the
+// repo (and the lock) and deletes nothing; abort changes nothing.
+func TestFirstSyncKeepsLocalSkills(t *testing.T) {
+	e, choice := fixture(t)
+	write(t, filepath.Join(e.Agents, "skills/mine/SKILL.md"), "mine\n")
+	write(t, filepath.Join(e.Agents, ".skill-lock.json"), `{"skills":{"mine":{"source":"x"}}}`)
+
+	if err := pass(t, e); !errors.Is(err, errStop) {
+		t.Fatalf("abort: want errStop, got %v", err)
+	}
+	if read(t, filepath.Join(e.Agents, "skills/mine/SKILL.md")) != "mine\n" {
+		t.Fatal("abort touched the local skill")
+	}
+
+	*choice = "merge"
+	must(t, pass(t, e))
+	if read(t, filepath.Join(e.Repo, "agents/skills/mine/SKILL.md")) != "mine\n" {
+		t.Error("local skill not merged into the repo")
+	}
+	if read(t, filepath.Join(e.Repo, "agents/skills/s1/SKILL.md")) != "s1\n" {
+		t.Error("merge deleted a repo skill")
+	}
+	if !strings.Contains(read(t, filepath.Join(e.Repo, "agents/.skill-lock.json")), "mine") {
+		t.Error("lock entry not merged")
+	}
+	if read(t, filepath.Join(e.Agents, "skills/mine/SKILL.md")) != "mine\n" {
+		t.Error("merge deleted the local skill")
+	}
+}
+
+func TestClaudeSkillsCaptured(t *testing.T) {
+	e, choice := fixture(t)
+	write(t, filepath.Join(e.Claude, "skills/handmade/SKILL.md"), "hand\n")
+	must(t, os.MkdirAll(filepath.Join(e.Claude, "skills/learned"), 0o755)) // Claude's own store, no SKILL.md
+	*choice = "skip"
+	must(t, pass(t, e))
+	if _, err := os.Stat(filepath.Join(e.Repo, "skills/handmade")); err == nil {
+		t.Fatal("skip captured the skill")
+	}
+	*choice = "capture"
+	must(t, pass(t, e))
+	if read(t, filepath.Join(e.Repo, "skills/handmade/SKILL.md")) != "hand\n" {
+		t.Error("handmade skill not captured")
+	}
+	if _, err := os.Stat(filepath.Join(e.Repo, "skills/learned")); err == nil {
+		t.Error("captured a dir without SKILL.md")
+	}
+}
