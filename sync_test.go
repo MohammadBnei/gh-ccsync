@@ -439,3 +439,90 @@ func TestFirstSyncSymlinkedAgents(t *testing.T) {
 		t.Error("snapshot of a symlinked ~/.agents is empty")
 	}
 }
+
+// A machine's first sync: its own settings.json is not drift from a sync, so
+// merge keeps it in this host's overlay and never touches the shared base.
+func TestFirstSyncSettingsMerge(t *testing.T) {
+	e, choice := fixture(t)
+	live := filepath.Join(e.Claude, "settings.json")
+	base := filepath.Join(e.Repo, "settings.base.json")
+	write(t, live, `{"theme":"dark","model":"opus","enabledPlugins":{"a":true},"autoMode":{"env":"wsl"}}`)
+
+	if err := pass(t, e); !errors.Is(err, errStop) {
+		t.Fatalf("abort: want errStop, got %v", err)
+	}
+	if !strings.Contains(read(t, live), "opus") {
+		t.Fatal("abort rewrote settings.json")
+	}
+
+	*choice = "merge"
+	must(t, pass(t, e))
+	h := read(t, filepath.Join(e.Repo, "hosts/h1.json"))
+	if !strings.Contains(h, `"model": "opus"`) || !strings.Contains(h, `"theme": "dark"`) || strings.Contains(h, "autoMode") {
+		t.Errorf("host overlay: %s", h)
+	}
+	if !strings.Contains(read(t, filepath.Join(e.Repo, "hosts/h1.local.json")), "wsl") {
+		t.Error("autoMode not merged into the local overlay")
+	}
+	if read(t, base) != `{"theme":"light"}` {
+		t.Errorf("base changed: %s", read(t, base))
+	}
+	if s := read(t, live); !strings.Contains(s, "dark") || !strings.Contains(s, "opus") {
+		t.Errorf("merge lost local settings: %s", s)
+	}
+	if !strings.Contains(e.Out.(*bytes.Buffer).String(), "overrides base: theme") {
+		t.Error("no shadow notice for theme")
+	}
+
+	commitAll(t, e.Repo)
+	*choice = "abort" // nothing left to ask
+	must(t, pass(t, e))
+	if e.changes != 0 {
+		t.Errorf("run after the commit not idempotent: %d changes", e.changes)
+	}
+}
+
+// Keys only the repo has are added on a first sync, without asking.
+func TestFirstSyncSettingsOnlyInRepo(t *testing.T) {
+	e, _ := fixture(t)
+	write(t, filepath.Join(e.Claude, "settings.json"), `{"enabledPlugins":{"a":true}}`)
+	must(t, pass(t, e))
+	if !strings.Contains(read(t, filepath.Join(e.Claude, "settings.json")), "light") {
+		t.Error("base key not written")
+	}
+}
+
+// A committed host file (same id, reinstalled machine) keeps keys live lacks;
+// a local-only difference leaves the repo clean.
+func TestFirstSyncSettingsMergeKeepsHostKeys(t *testing.T) {
+	e, choice := fixture(t)
+	write(t, filepath.Join(e.Repo, "hosts/h1.json"), `{"enabledPlugins":{"a":true},"x":1}`)
+	commitAll(t, e.Repo)
+	write(t, filepath.Join(e.Claude, "settings.json"), `{"theme":"light","enabledPlugins":{"a":true},"autoMode":{"env":"new"}}`)
+	*choice = "merge"
+	must(t, pass(t, e))
+	if !strings.Contains(read(t, filepath.Join(e.Repo, "hosts/h1.json")), `"x"`) {
+		t.Error("merge deleted a host key live lacks")
+	}
+	if st, _ := git(e.Repo, "status", "--porcelain"); st != "" {
+		t.Errorf("local-only merge dirtied the repo: %s", st)
+	}
+}
+
+// On a tty with claude installed, merge offers an interactive claude in the repo.
+func TestFirstSyncSettingsHandoff(t *testing.T) {
+	e, choice := fixture(t)
+	write(t, filepath.Join(e.Claude, "settings.json"), `{"theme":"dark","enabledPlugins":{"a":true},"autoMode":{"env":"private"}}`)
+	*choice = "merge"
+	e.ToolMode = ToolsAsk
+	e.Look = func(n string) bool { return n == "claude" }
+	var ran []string
+	e.Sh = func(s string, _ io.Writer) error { ran = append(ran, s); return nil }
+	must(t, pass(t, e))
+	if len(ran) != 1 || !strings.HasPrefix(ran[0], "claude '") || !strings.Contains(ran[0], `machine'\''s`) {
+		t.Fatalf("handoff: %q", ran)
+	}
+	if strings.Contains(read(t, filepath.Join(e.Claude, "settings.json")), "light") {
+		t.Error("handoff stops before writing settings.json")
+	}
+}

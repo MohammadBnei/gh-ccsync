@@ -16,11 +16,11 @@ const usage = `gh ccsync — sync a Claude Code config repo into ~/.claude and ~
 
   gh ccsync                         pull, then apply (asks on local drift)
   gh ccsync capture                 copy local changes back into the repo
-  gh ccsync init <owner/repo> [dir] clone the config repo (default ~/Code/claude-config), then apply
+  gh ccsync init <owner/repo> [dir] clone the config repo (asks where; an existing dir is reused), then apply
   gh ccsync tools [--yes] [name…]   install missing tools/plugins, update present ones
   gh ccsync where                   print the config repo path
 
-CCSYNC_CHOICE=<abort|capture|overwrite|skip|replace> answers prompts without a tty.
+CCSYNC_CHOICE=<abort|capture|merge|overwrite|skip|replace> answers prompts without a tty.
 It never installs tools: without a tty only "gh ccsync tools --yes" does.`
 
 func main() {
@@ -87,9 +87,17 @@ func run(args []string) error {
 		if len(args) < 2 {
 			return errors.New("usage: gh ccsync init <owner/repo> [dir]")
 		}
-		dir := filepath.Join(home, "Code", "claude-config")
+		var dir string
 		if len(args) > 2 {
 			dir = args[2]
+		} else {
+			dir = e.Input("Clone into", "~/Code/claude-config")
+		}
+		if dir == "~" || strings.HasPrefix(dir, "~/") {
+			dir = filepath.Join(home, strings.TrimPrefix(dir, "~"))
+		}
+		if dir == "" {
+			return errors.New("empty clone dir")
 		}
 		if _, err := os.Stat(dir); errors.Is(err, os.ErrNotExist) {
 			c := exec.Command("gh", "repo", "clone", args[1], dir)
