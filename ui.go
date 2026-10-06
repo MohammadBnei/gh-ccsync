@@ -1,6 +1,7 @@
 package main
 
 import (
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -70,7 +71,9 @@ func terminalUI() UI {
 			return def
 		}
 		v := def
-		_ = huh.NewInput().Title(header).Value(&v).Run()
+		if err := huh.NewInput().Title(header).Value(&v).Run(); errors.Is(err, huh.ErrUserAborted) {
+			return "" // ctrl-c: callers stop on empty
+		}
 		return strings.TrimSpace(v)
 	}
 	u.Spin = func(title string, fn func() error) error {
