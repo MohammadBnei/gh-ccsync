@@ -223,6 +223,24 @@ func TestLinkDrift(t *testing.T) {
 	}
 }
 
+func TestStaleLinkRemoved(t *testing.T) {
+	e, _ := fixture(t)
+	must(t, pass(t, e))
+	must(t, os.Remove(filepath.Join(e.Repo, "statusline.sh")))
+	commitAll(t, e.Repo)
+	must(t, pass(t, e))
+	if _, err := os.Lstat(filepath.Join(e.Claude, "statusline.sh")); !os.IsNotExist(err) {
+		t.Fatalf("stale link kept: %v", err)
+	}
+	if e.changes == 0 {
+		t.Error("removal not counted")
+	}
+	must(t, pass(t, e))
+	if e.changes != 0 {
+		t.Fatalf("not idempotent after removal: %d changes", e.changes)
+	}
+}
+
 func TestNewHostOverlay(t *testing.T) {
 	e, choice := fixture(t)
 	write(t, filepath.Join(e.Cfg, "host"), "h2\n")

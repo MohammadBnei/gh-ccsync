@@ -524,6 +524,13 @@ func (e *Env) syncLinks() error {
 
 func (e *Env) link(src, dst string) error {
 	if _, err := os.Stat(src); err != nil {
+		if t, _ := os.Readlink(dst); t == src {
+			if err := os.Remove(dst); err != nil {
+				return err
+			}
+			e.changes++
+			e.ok("removed stale link %s", e.short(dst))
+		}
 		return nil // optional file missing from the repo
 	}
 	fi, err := os.Lstat(dst)
